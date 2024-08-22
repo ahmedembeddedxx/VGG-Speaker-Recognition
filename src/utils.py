@@ -1,53 +1,45 @@
 # Third Party
 import librosa
 import numpy as np
-import time as timelib
-import scipy
 import soundfile as sf
 import scipy.signal as sps
-from scipy import interpolate
+
 # ===============================================
-#       code from Arsha for loading data.
+#       Code for loading data.
 # ===============================================
-def load_wav_fast(vid_path, sr, mode='train'):
-    """load_wav() is really slow on this version of librosa.
-    load_wav_fast() is faster but we are not ensuring a consistent sampling rate"""
-    wav, sr_ret = sf.read(vid_path)
+def load_wav(vid_path, sr, mode='train', use_fast=False):
+    """Load audio file and extend it. Optionally reverse audio for data augmentation."""
+    if use_fast:
+        try:
+            wav, sr_ret = sf.read(vid_path)
+        except Exception as e:
+            raise RuntimeError(f"Error reading {vid_path}: {e}")
+    else:
+        wav, sr_ret = librosa.load(vid_path, sr=None)
+        if sr_ret != sr:
+            raise ValueError(f"Expected sampling rate {sr}, but got {sr_ret}")
 
     if mode == 'train':
         extended_wav = np.append(wav, wav)
         if np.random.random() < 0.3:
             extended_wav = extended_wav[::-1]
-        return extended_wav
     else:
         extended_wav = np.append(wav, wav[::-1])
-        return extended_wav
 
-def load_wav(vid_path, sr, mode='train'):
-    wav, sr_ret = librosa.load(vid_path, sr=sr)
-    assert sr_ret == sr
+    return extended_wav
 
-    if mode == 'train':
-        extended_wav = np.append(wav, wav)
-        if np.random.random() < 0.3:
-            extended_wav = extended_wav[::-1]
-        return extended_wav
-    else:
-        extended_wav = np.append(wav, wav[::-1])
-        return extended_wav
-
-
-def lin_spectogram_from_wav(wav, hop_length, win_length, n_fft=1024):
-    linear = librosa.stft(wav, n_fft=n_fft, win_length=win_length, hop_length=hop_length) # linear spectrogram
-    return linear.T
-
+def lin_spectrogram_from_wav(wav, hop_length, win_length, n_fft=1024):
+    """Generate a linear spectrogram from the waveform."""
+    return librosa.stft(wav, n_fft=n_fft, win_length=win_length, hop_length=hop_length).T
 
 def load_data(path, win_length=400, sr=16000, hop_length=160, n_fft=512, spec_len=250, mode='train'):
-    wav = load_wav(path, sr=sr, mode=mode)
-    linear_spect = lin_spectogram_from_wav(wav, hop_length, win_length, n_fft)
+    """Load audio data, compute its spectrogram, and preprocess it."""
+    wav = load_wav(path, sr=sr, mode=mode, use_fast=True)
+    linear_spect = lin_spectrogram_from_wav(wav, hop_length, win_length, n_fft)
     mag, _ = librosa.magphase(linear_spect)  # magnitude
     mag_T = mag.T
     freq, time = mag_T.shape
+
     if mode == 'train':
         if time > spec_len:
             randtime = np.random.randint(0, time-spec_len)
@@ -56,9 +48,9 @@ def load_data(path, win_length=400, sr=16000, hop_length=160, n_fft=512, spec_le
             spec_mag = np.pad(mag_T, ((0, 0), (0, spec_len - time)), 'constant')
     else:
         spec_mag = mag_T
-    # preprocessing, subtract mean, divided by time-wise var
-    mu = np.mean(spec_mag, 0, keepdims=True)
-    std = np.std(spec_mag, 0, keepdims=True)
+
+    # Preprocessing: subtract mean and divide by time-wise variance
+    mu = np.mean(spec_mag, axis=0, keepdims=True)
+    std = np.std(spec_mag, axis=0, keepdims=True)
+    
     return (spec_mag - mu) / (std + 1e-5)
-
-

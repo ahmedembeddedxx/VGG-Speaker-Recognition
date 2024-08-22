@@ -1,142 +1,241 @@
-from __future__ import absolute_import
-from __future__ import print_function
-import os
-import sys
+
 import numpy as np
+import tensorflow as tf
+import librosa
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Conv2D, Dense, Lambda, AveragePooling2D, GlobalAveragePooling2D
+from tensorflow.keras import backend as K
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import Adam, SGD
+import backbone
+import model as mod
 
-sys.path.append('../tool')
-import toolkits
-import utils as ut
+# Define amsoftmax_loss function
+def amsoftmax_loss(y_true, y_pred, scale=30, margin=0.35):
+    y_pred = y_true * (y_pred - margin) + (1 - y_true) * y_pred
+    y_pred *= scale
+    return K.categorical_crossentropy(y_true, y_pred, from_logits=True)
 
-import pdb
-# ===========================================
-#        Parse the argument
-# ===========================================
-import argparse
-parser = argparse.ArgumentParser()
-# set up training configuration.
-parser.add_argument('--gpu', default='', type=str)
-parser.add_argument('--resume', default='', type=str)
-parser.add_argument('--batch_size', default=16, type=int)
-parser.add_argument('--data_path', default='/media/weidi/2TB-2/datasets/voxceleb1/wav', type=str)
-# set up network configuration.
-parser.add_argument('--net', default='resnet34s', choices=['resnet34s', 'resnet34l'], type=str)
-parser.add_argument('--ghost_cluster', default=2, type=int)
-parser.add_argument('--vlad_cluster', default=8, type=int)
-parser.add_argument('--bottleneck_dim', default=512, type=int)
-parser.add_argument('--aggregation_mode', default='gvlad', choices=['avg', 'vlad', 'gvlad'], type=str)
-# set up learning rate, training loss and optimizer.
-parser.add_argument('--loss', default='softmax', choices=['softmax', 'amsoftmax'], type=str)
-parser.add_argument('--test_type', default='normal', choices=['normal', 'hard', 'extend'], type=str)
+# Define a class to hold model arguments
+class ModelArgs:
+    def __init__(self, net, loss, vlad_cluster, ghost_cluster, bottleneck_dim, aggregation_mode, optimizer):
+        self.net = net
+        self.loss = loss
+        self.vlad_cluster = vlad_cluster
+        self.ghost_cluster = ghost_cluster
+        self.bottleneck_dim = bottleneck_dim
+        self.aggregation_mode = aggregation_mode
+        self.optimizer = optimizer
 
-global args
-args = parser.parse_args()
+# Define the model architecture
+def vggvox_resnet2d_icassp(input_dim=(257, 250, 1), num_class=8631, mode='eval', args=None):
+    if args is None:
+        raise ValueError("The 'args' parameter is required but not provided.")
+    
+    if not hasattr(args, 'loss'):
+        raise AttributeError("The 'args' object must have an attribute 'loss'.")
+    mode='eval'
+    net = args.net
+    loss = args.loss
+    vlad_clusters = args.vlad_cluster
+    ghost_clusters = args.ghost_cluster
+    bottleneck_dim = args.bottleneck_dim
+    aggregation = args.aggregation_mode
+    mgpu = len(tf.config.list_physical_devices('GPU'))
+    
+    weight_decay = 1e-4  # Define weight decay for regularization
 
-def main():
-
-    # gpu configuration
-    toolkits.initialize_GPU(args)
-
-    import model
-    # ==================================
-    #       Get Train/Val.
-    # ==================================
-    print('==> calculating test({}) data lists...'.format(args.test_type))
-
-    if args.test_type == 'normal':
-        verify_list = np.loadtxt('../meta/voxceleb1_veri_test.txt', str)
-    elif args.test_type == 'hard':
-        verify_list = np.loadtxt('../meta/voxceleb1_veri_test_hard.txt', str)
-    elif args.test_type == 'extend':
-        verify_list = np.loadtxt('../meta/voxceleb1_veri_test_extended.txt', str)
+    # Initialize the ResNet architecture
+    if net == 'resnet34s':
+        inputs, x = backbone.resnet_2D_v1(input_dim=input_dim, mode=mode)
     else:
-        raise IOError('==> unknown test type.')
+        inputs, x = backbone.resnet_2D_v2(input_dim=input_dim, mode=mode)
+    
+    # Fully Connected Block 1
+    x_fc = Conv2D(bottleneck_dim, (7, 1),
+                   strides=(1, 1),
+                   activation='relu',
+                   kernel_initializer='orthogonal',
+                   use_bias=True, trainable=True,
+                   kernel_regularizer=l2(weight_decay),
+                   bias_regularizer=l2(weight_decay),
+                   name='x_fc')(x)
 
-    verify_lb = np.array([int(i[0]) for i in verify_list])
-    list1 = np.array([os.path.join(args.data_path, i[1]) for i in verify_list])
-    list2 = np.array([os.path.join(args.data_path, i[2]) for i in verify_list])
-
-    total_list = np.concatenate((list1, list2))
-    unique_list = np.unique(total_list)
-
-    # ==================================
-    #       Get Model
-    # ==================================
-    # construct the data generator.
-    params = {'dim': (257, None, 1),
-              'nfft': 512,
-              'spec_len': 250,
-              'win_length': 400,
-              'hop_length': 160,
-              'n_classes': 5994,
-              'sampling_rate': 16000,
-              'normalize': True,
-              }
-
-    network_eval = model.vggvox_resnet2d_icassp(input_dim=params['dim'],
-                                                num_class=params['n_classes'],
-                                                mode='eval', args=args)
-
-    # ==> load pre-trained model ???
-    if args.resume:
-        # ==> get real_model from arguments input,
-        # load the model if the imag_model == real_model.
-        if os.path.isfile(args.resume):
-            network_eval.load_weights(os.path.join(args.resume), by_name=True)
-            result_path = set_result_path(args)
-            print('==> successfully loading model {}.'.format(args.resume))
+    # Feature Aggregation
+    if aggregation == 'avg':
+        if mode == 'train':
+            x = AveragePooling2D((1, 5), strides=(1, 1), name='avg_pool')(x)
+            x = tf.reshape(x, (-1, bottleneck_dim))
         else:
-            raise IOError("==> no checkpoint found at '{}'".format(args.resume))
+            x = GlobalAveragePooling2D(name='avg_pool')(x)
+            x = tf.reshape(x, (1, bottleneck_dim))
+
+    elif aggregation == 'vlad':
+        x_k_center = Conv2D(vlad_clusters, (7, 1),
+                            strides=(1, 1),
+                            kernel_initializer='orthogonal',
+                            use_bias=True, trainable=True,
+                            kernel_regularizer=l2(weight_decay),
+                            bias_regularizer=l2(weight_decay),
+                            name='vlad_center_assignment')(x)
+        x = mod.VladPooling(k_centers=vlad_clusters, mode='vlad', name='vlad_pool')([x_fc, x_k_center])
+
+    elif aggregation == 'gvlad':
+        x_k_center = Conv2D(vlad_clusters + ghost_clusters, (7, 1),
+                            strides=(1, 1),
+                            kernel_initializer='orthogonal',
+                            use_bias=True, trainable=True,
+                            kernel_regularizer=l2(weight_decay),
+                            bias_regularizer=l2(weight_decay),
+                            name='gvlad_center_assignment')(x)
+        x = mod.VladPooling(k_centers=vlad_clusters, g_centers=ghost_clusters, mode='gvlad', name='gvlad_pool')([x_fc, x_k_center])
+
     else:
-        raise IOError('==> please type in the model to load')
+        raise ValueError('==> unknown aggregation mode')
 
-    print('==> start testing.')
+    # Fully Connected Block 2
+    x = Dense(bottleneck_dim, activation='relu',
+              kernel_initializer='orthogonal',
+              use_bias=True, trainable=True,
+              kernel_regularizer=l2(weight_decay),
+              bias_regularizer=l2(weight_decay),
+              name='fc6')(x)
 
-    # The feature extraction process has to be done sample-by-sample,
-    # because each sample is of different lengths.
-    total_length = len(unique_list)
-    feats, scores, labels = [], [], []
-    for c, ID in enumerate(unique_list):
-        if c % 50 == 0: print('Finish extracting features for {}/{}th wav.'.format(c, total_length))
-        specs = ut.load_data(ID, win_length=params['win_length'], sr=params['sampling_rate'],
-                             hop_length=params['hop_length'], n_fft=params['nfft'],
-                             spec_len=params['spec_len'], mode='eval')
-        specs = np.expand_dims(np.expand_dims(specs, 0), -1)
+    # Softmax Vs AMSoftmax
+    if loss == 'softmax':
+        y = Dense(num_class, activation='softmax',
+                  kernel_initializer='orthogonal',
+                  use_bias=False, trainable=True,
+                  kernel_regularizer=l2(weight_decay),
+                  bias_regularizer=l2(weight_decay),
+                  name='prediction')(x)
+        trnloss = 'categorical_crossentropy'
+
+    elif loss == 'amsoftmax':
+        x_l2 = Lambda(lambda x: K.l2_normalize(x, 1))(x)
+        y = Dense(num_class,
+                  kernel_initializer='orthogonal',
+                  use_bias=False, trainable=True,
+                  kernel_constraint=tf.keras.constraints.UnitNorm(),
+                  kernel_regularizer=l2(weight_decay),
+                  bias_regularizer=l2(weight_decay),
+                  name='prediction')(x_l2)
+        trnloss = amsoftmax_loss
+
+    else:
+        raise ValueError('==> unknown loss.')
+
+    if mode == 'eval':
+        y = Lambda(lambda x: K.l2_normalize(x, 1))(x)
+
+    model = Model(inputs, y, name='vggvox_resnet2D_{}_{}'.format(loss, aggregation))
+
+    if mode == 'train':
+        if mgpu > 1:
+            model = ModelMGPU(model, gpus=mgpu)
+        # Set up optimizer
+        if args.optimizer == 'adam':
+            opt = Adam(learning_rate=1e-3)
+        elif args.optimizer == 'sgd':
+            opt = SGD(learning_rate=0.1, momentum=0.9, decay=0.0, nesterov=True)
+        else:
+            raise ValueError('==> unknown optimizer type')
+        model.compile(optimizer=opt, loss=trnloss, metrics=['acc'])
+    return model
+
+def load_pretrained_model(model_path):
+    """
+    Load the pretrained VGGVox model with weights.
+    """
+    # Define model arguments or configuration here
+    args = ModelArgs(
+        net='resnet34s',
+        loss='softmax',
+        vlad_cluster=8,
+        ghost_cluster=2,
+        bottleneck_dim=512,
+        aggregation_mode='vlad',
+        optimizer='adam'
+    )
     
-        v = network_eval.predict(specs)
-        feats += [v]
+    # Initialize the model
+    model = vggvox_resnet2d_icassp(args=args)
     
-    feats = np.array(feats)
-
-    # ==> compute the pair-wise similarity.
-    for c, (p1, p2) in enumerate(zip(list1, list2)):
-        ind1 = np.where(unique_list == p1)[0][0]
-        ind2 = np.where(unique_list == p2)[0][0]
-
-        v1 = feats[ind1, 0]
-        v2 = feats[ind2, 0]
-
-        scores += [np.sum(v1*v2)]
-        labels += [verify_lb[c]]
-        print('scores : {}, gt : {}'.format(scores[-1], verify_lb[c]))
-
-    scores = np.array(scores)
-    labels = np.array(labels)
-
-    np.save(os.path.join(result_path, 'prediction_scores.npy'), scores)
-    np.save(os.path.join(result_path, 'groundtruth_labels.npy'), labels)
-
-    eer, thresh = toolkits.calculate_eer(labels, scores)
-    print('==> model : {}, EER: {}'.format(args.resume, eer))
+    # Print model summary to check layer structure
+    # model.summary()
+    
+    try:
+        # Load weights
+        model.load_weights(model_path)
+    except ValueError as e:
+        print("Error loading weights:", e)
+        # Handle error or re-load model with updated structure
+    
+    return model
 
 
-def set_result_path(args):
-    model_path = args.resume
-    exp_path = model_path.split(os.sep)
-    result_path = os.path.join('../result', exp_path[2], exp_path[3])
-    if not os.path.exists(result_path): os.makedirs(result_path)
-    return result_path
+def preprocess_wav_file(wav_path, target_sr=16000, duration=5):
+    """
+    Load and preprocess a WAV file for model input.
+    """
+    y, sr = librosa.load(wav_path, sr=target_sr, duration=duration)
+    mel_spectrogram = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64, fmax=8000)
+    log_mel_spectrogram = np.log(mel_spectrogram + 1e-6)
+    
+    if log_mel_spectrogram.shape[1] < 250:
+        padding = 250 - log_mel_spectrogram.shape[1]
+        log_mel_spectrogram = np.pad(log_mel_spectrogram, ((0, 0), (0, padding)), mode='constant')
+    else:
+        log_mel_spectrogram = log_mel_spectrogram[:, :250]
+
+    log_mel_spectrogram = np.expand_dims(log_mel_spectrogram, axis=-1)
+    return np.expand_dims(log_mel_spectrogram, axis=0)
+def extract_embeddings(model, wav_path):
+    # Preprocess the audio file
+    preprocessed_audio = preprocess_wav_file(wav_path)
+    
+    # Print shape for debugging
+    print("Shape before padding:", preprocessed_audio.shape)
+    
+    # Apply padding
+    if preprocessed_audio.shape[1] < 257:
+        # Calculate padding width
+        pad_width = ((0, 0), (0, 257 - preprocessed_audio.shape[1]), (0, 0), (0, 0))
+        # Apply padding
+        preprocessed_audio = np.pad(preprocessed_audio, pad_width, mode='constant')
+    
+    # Print shape after padding
+    print("Shape after padding:", preprocessed_audio.shape)
+
+    # Predict embeddings
+    embeddings = model.predict(preprocessed_audio)
+    print("Embeddings shape:", embeddings.shape)
+    return embeddings
+
+# Path to the pretrained model and WAV file
+model_path = 'weights.h5'
+wav_path_0 = '00001.wav'
+wav_path_1 = '00002.wav'
+wav_path_2 = '00003.wav'
 
 
-if __name__ == "__main__":
-    main()
+
+# Load the model
+model = load_pretrained_model(model_path)
+
+# Extract embeddings
+
+embeddings0 = extract_embeddings(model, wav_path_0)
+embeddings1 = extract_embeddings(model, wav_path_1)
+embeddings2 = extract_embeddings(model, wav_path_2)
+
+# Calculate cosine similarity
+print('Same Person Similarity')
+similarity = np.dot(embeddings0, embeddings1.T)
+print(similarity)
+
+print('Different Person Similarity')
+similarity = np.dot(embeddings0, embeddings2.T)
+print(similarity)
+
+print('High EER expected!!!')

@@ -1,9 +1,12 @@
-from __future__ import absolute_import
-from __future__ import print_function
+from __future__ import absolute_import, print_function
 import os
 import sys
-import keras
 import numpy as np
+from pathlib import Path
+import argparse
+import tensorflow as tf
+from tensorflow.keras.callbacks import LearningRateScheduler, TensorBoard, ModelCheckpoint
+from tensorflow.keras import backend as K
 
 np.seterr(all='raise')
 
@@ -13,7 +16,6 @@ import toolkits
 # ===========================================
 #        Parse the argument
 # ===========================================
-import argparse
 parser = argparse.ArgumentParser()
 # set up training configuration.
 parser.add_argument('--gpu', default='', type=str)
@@ -35,7 +37,6 @@ parser.add_argument('--loss', default='softmax', choices=['softmax', 'amsoftmax'
 parser.add_argument('--optimizer', default='adam', choices=['adam', 'sgd'], type=str)
 parser.add_argument('--ohem_level', default=0, type=int,
                     help='pick hard samples from (ohem_level * batch_size) proposals, must be > 1')
-global args
 args = parser.parse_args()
 
 def main():
@@ -76,40 +77,37 @@ def main():
                                            num_class=params['n_classes'],
                                            mode='train', args=args)
     # ==> load pre-trained model ???
-    mgpu = len(keras.backend.tensorflow_backend._get_available_gpus())
+    mgpu = len(K.tensorflow_backend._get_available_gpus())
 
     if args.resume:
         print("Attempting to load", args.resume)
-        if args.resume:
-            if os.path.isfile(args.resume):
-                if mgpu == 1:
-                    # by_name=True, skip_mismatch=True
-                    # https://github.com/WeidiXie/VGG-Speaker-Recognition/issues/46
-                    network.load_weights(os.path.join(args.resume), by_name=True, skip_mismatch=True)
-                else:
-                    network.layers[mgpu + 1].load_weights(os.path.join(args.resume))
-                print('==> successfully loading model {}.'.format(args.resume))
+        if os.path.isfile(args.resume):
+            if mgpu == 1:
+                # by_name=True, skip_mismatch=True
+                network.load_weights(os.path.join(args.resume), by_name=True, skip_mismatch=True)
             else:
-                print("==> no checkpoint found at '{}'".format(args.resume))
+                network.layers[mgpu + 1].load_weights(os.path.join(args.resume))
+            print(f'Successfully loaded model {args.resume}.')
+        else:
+            print(f"No checkpoint found at '{args.resume}'")
 
     print(network.summary())
-    print('==> gpu {} is, training {} images, classes: 0-{} '
-          'loss: {}, aggregation: {}, ohemlevel: {}'.format(args.gpu, len(partition['train']), np.max(labels['train']),
-                                                            args.loss, args.aggregation_mode, args.ohem_level))
+    print(f'GPU {args.gpu} is training {len(partition["train"])} images, classes: 0-{np.max(labels["train"])} '
+          f'loss: {args.loss}, aggregation: {args.aggregation_mode}, ohemlevel: {args.ohem_level}')
 
     model_path, log_path = set_path(args)
-    normal_lr = keras.callbacks.LearningRateScheduler(step_decay)
-    tbcallbacks = keras.callbacks.TensorBoard(log_dir=log_path, histogram_freq=0, write_graph=True, write_images=False,
-                                              update_freq=args.batch_size * 16)
-    callbacks = [keras.callbacks.ModelCheckpoint(os.path.join(model_path, 'weights-{epoch:02d}-{acc:.3f}.h5'),
-                                                 monitor='loss',
-                                                 mode='min',
-                                                 save_best_only=True),
+    normal_lr = LearningRateScheduler(step_decay)
+    tbcallbacks = TensorBoard(log_dir=log_path, histogram_freq=0, write_graph=True, write_images=False,
+                              update_freq=args.batch_size * 16)
+    callbacks = [ModelCheckpoint(Path(model_path) / 'weights-{epoch:02d}-{acc:.3f}.h5',
+                                 monitor='loss',
+                                 mode='min',
+                                 save_best_only=True),
                  normal_lr, tbcallbacks]
 
     if args.ohem_level > 1:     # online hard negative mining will be used
         candidate_steps = int(len(partition['train']) // args.batch_size)
-        iters_per_epoch = int(len(partition['train']) // (args.ohem_level*args.batch_size))
+        iters_per_epoch = int(len(partition['train']) // (args.ohem_level * args.batch_size))
 
         ohem_generator = generator.OHEM_generator(network,
                                                   trn_gen,
@@ -135,7 +133,7 @@ def main():
 
     else:
         network.fit_generator(trn_gen,
-                              steps_per_epoch=int(len(partition['train'])//args.batch_size),
+                              steps_per_epoch=int(len(partition['train']) // args.batch_size),
                               epochs=args.epochs,
                               max_queue_size=10,
                               callbacks=callbacks,
@@ -169,36 +167,34 @@ def step_decay(epoch):
         if epoch < milestone[s]:
             lr = init_lr * gamma[s]
             break
-    print('Learning rate for epoch {} is {}.'.format(epoch + 1, lr))
-    return np.float(lr)
+    print(f'Learning rate for epoch {epoch + 1} is {lr}.')
+    return float(lr)
 
 
 def set_path(args):
-    import datetime
     date = datetime.datetime.now().strftime("%Y-%m-%d")
 
     if args.aggregation_mode == 'avg':
-        exp_path = os.path.join(args.aggregation_mode+'_{}'.format(args.loss),
-                                '{0}_{args.net}_bs{args.batch_size}_{args.optimizer}_'
-                                'lr{args.lr}_bdim{args.bottleneck_dim}_ohemlevel{args.ohem_level}'.format(date, args=args))
+        exp_path = os.path.join(args.aggregation_mode + f'_{args.loss}',
+                                f'{date}_{args.net}_bs{args.batch_size}_{args.optimizer}_'
+                                f'lr{args.lr}_bdim{args.bottleneck_dim}_ohemlevel{args.ohem_level}')
     elif args.aggregation_mode == 'vlad':
-        exp_path = os.path.join(args.aggregation_mode+'_{}'.format(args.loss),
-                                '{0}_{args.net}_bs{args.batch_size}_{args.optimizer}_'
-                                'lr{args.lr}_vlad{args.vlad_cluster}_'
-                                'bdim{args.bottleneck_dim}_ohemlevel{args.ohem_level}'.format(date, args=args))
+        exp_path = os.path.join(args.aggregation_mode + f'_{args.loss}',
+                                f'{date}_{args.net}_bs{args.batch_size}_{args.optimizer}_'
+                                f'lr{args.lr}_vlad{args.vlad_cluster}_'
+                                f'bdim{args.bottleneck_dim}_ohemlevel{args.ohem_level}')
     elif args.aggregation_mode == 'gvlad':
-        exp_path = os.path.join(args.aggregation_mode+'_{}'.format(args.loss),
-                                '{0}_{args.net}_bs{args.batch_size}_{args.optimizer}_'
-                                'lr{args.lr}_vlad{args.vlad_cluster}_ghost{args.ghost_cluster}_'
-                                'bdim{args.bottleneck_dim}_ohemlevel{args.ohem_level}'.format(date, args=args))
-    else:
-        raise IOError('==> unknown aggregation mode.')
-    model_path = os.path.join('../model', exp_path)
-    log_path = os.path.join('../log', exp_path)
-    if not os.path.exists(model_path): os.makedirs(model_path)
-    if not os.path.exists(log_path): os.makedirs(log_path)
+        exp_path = os.path.join(args.aggregation_mode + f'_{args.loss}',
+                                f'{date}_{args.net}_bs{args.batch_size}_{args.optimizer}_'
+                                f'lr{args.lr}_vlad{args.vlad_cluster}_'
+                                f'ghost{args.ghost_cluster}_bdim{args.bottleneck_dim}_ohemlevel{args.ohem_level}')
+
+    exp_path = Path(exp_path)
+    exp_path.mkdir(parents=True, exist_ok=True)
+    model_path = str(exp_path)
+    log_path = str(exp_path / 'logs')
     return model_path, log_path
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

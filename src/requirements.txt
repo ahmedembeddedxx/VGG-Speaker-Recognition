@@ -1,0 +1,8 @@
+tensorflow>=2.0.0
+numpy>=1.18.5
+scipy>=1.5.2
+scikit-learn>=0.24.0
+librosa>=0.8.0
+soundfile>=0.10.3
+opencv-python>=4.5.1
+sys
